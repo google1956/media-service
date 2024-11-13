@@ -1,0 +1,441 @@
+# This file is a template, and might need editing before it works on your project.
+# To contribute improvements to CI/CD templates, please follow the Development guide at:
+# https://docs.gitlab.com/ee/development/cicd/templates.html
+# This specific template is located at:
+# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Getting-Started.gitlab-ci.yml
+
+# This is a sample GitLab CI/CD configuration file that should run without any modifications.
+# It demonstrates a basic 3 stage CI/CD pipeline. Instead of real tests or scripts,
+# it uses echo commands to simulate the pipeline execution.
+#
+# A pipeline is composed of independent jobs that run scripts, grouped into stages.
+# Stages run in sequential order, but jobs within stages run in parallel.
+#
+# For more information, see: https://docs.gitlab.com/ee/ci/yaml/README.html#stages
+
+# Cache
+.cache-node_modules: &cache-node_modules
+  key:
+    files:
+      - yarn.lock
+      - package.json
+  paths:
+    - node_modules
+    - package-lock.json
+    - package.json
+    - yarn.lock
+
+default:
+  image: node:lts-alpine3.18
+  interruptible: true
+
+variables:
+  GCP_HOST_DOCKER: $GCP_REGISTRY_IMAGE/$GCP_PROJECT_ID/$CI_PROJECT_PATH_SLUG
+  BYPASS_TEST:
+    description: "Bypass the test stage"
+    value: "false"
+    options:
+      - "true"
+      - "false"
+  PIPELINE_NAME: "Pipeline: $CI_PIPELINE_SOURCE - $CI_COMMIT_TITLE"
+  IMAGE_TAG: $CI_COMMIT_SHORT_SHA
+  CHANGE_CAUSE: "$CI_PIPELINE_CREATED_AT | Pipeline: $CI_PIPELINE_ID | Commit: $CI_COMMIT_SHORT_SHA CI_COMMIT_TITLE"
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+    on_job_failure: all
+  name: "$PIPELINE_NAME"
+  rules:
+    - if: "$CI_COMMIT_TAG"
+      variables:
+        PIPELINE_NAME: "Tag Pipeline: $CI_COMMIT_TAG"
+        IMAGE_TAG: $CI_COMMIT_TAG
+    - if: '$CI_COMMIT_BRANCH =~ "/develop|^fix-release\-\S{1,}$|^release\-\S{1,}$|^main$|^hotfix\-\S{1,}$/"'
+      variables:
+        IMAGE_TAG: "$CI_COMMIT_BRANCH-$CI_COMMIT_SHORT_SHA"
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      variables:
+        PIPELINE_NAME: "Push Pipeline: $CI_COMMIT_TITLE"
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      variables:
+        PIPELINE_NAME: "Manual Pipeline: $CI_COMMIT_TITLE"
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      variables:
+        PIPELINE_NAME: "MR Pipeline: $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME into $CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+
+stages: # List of stages for jobs, and their order of execution
+  - prepare
+  - compile
+  - test
+  - build
+  - develop
+  - beta
+  - production
+
+# rules for build stage
+.rules:build:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ "/^develop$|^release\-\S{1,}$/"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: on_success
+    - if: "$CI_COMMIT_TAG"
+      when: on_success
+
+# rules for test stage
+.rules:test:
+  rules:
+    - !reference [.rules:build, rules]
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED == "true"'
+      when: on_success
+
+# rules for deploy stage
+.rules:deploy:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH =~ "/^develop$|^release\-\S{1,}$/"'
+      when: manual
+    - if: "$CI_COMMIT_TAG"
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+
+.rules:deploy-prod:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "web" && $CI_COMMIT_BRANCH =~ "/^hotfix\-\S{1,}$|^main$/"'
+      when: manual
+    - if: "$CI_COMMIT_TAG"
+      when: manual
+    - when: never
+
+# Build template.
+.build_docker_template:
+  image: docker:git
+  services:
+    - docker:19.03-dind
+  variables:
+    GIT_STRATEGY: none
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: tcp://docker:2375
+
+.job:deploy:
+  tags:
+    - k8s
+  image:
+    name: bitnami/kubectl
+    entrypoint: [""]
+  needs:
+    - job: build:image
+      artifacts: false
+  artifacts:
+    when: on_success
+    expire_in: 2 weeks
+    paths:
+      - revision.env
+  before_script:
+    # assign variables
+    - echo $K8S_CONFIG
+    - REPLICA=$(echo $K8S_CONFIG | jq '.replica')
+    - echo $REPLICA
+    - CPU_REQUEST=$(echo $K8S_CONFIG | jq '.resources.requests.cpu')
+    - echo $CPU_REQUEST
+    - MEMORY_REQUEST=$(echo $K8S_CONFIG | jq '.resources.requests.memory')
+    - echo $MEMORY_REQUEST
+    - CPU_LIMIT=$(echo $K8S_CONFIG | jq '.resources.limits.cpu')
+    - echo $CPU_LIMIT
+    - MEMORY_LIMIT=$(echo $K8S_CONFIG | jq '.resources.limits.memory')
+    - echo $MEMORY_LIMIT
+    - MIN_REPLICAS=$(echo $K8S_CONFIG | jq '.autoscaling.minReplicas')
+    - echo $MIN_REPLICAS
+    - MAX_REPLICAS=$(echo $K8S_CONFIG | jq '.autoscaling.maxReplicas')
+    - echo $MAX_REPLICAS
+    - CPU_TARGET=$(echo $K8S_CONFIG | jq '.autoscaling.targetCPU')
+    - echo $CPU_TARGET
+    - MEMORY_TARGET=$(echo $K8S_CONFIG | jq '.autoscaling.targetMemory')
+    - echo $MEMORY_TARGET
+    #
+    - kubectl config get-contexts
+    - kubectl config use-context $KUBE_CONTEXT
+    - echo "deployment/$CI_PROJECT_PATH_SLUG"
+    - |
+      if kubectl get deployment/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}'; then
+          echo "PREVIOUS_REVISION=$(kubectl get deployment/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}')" > revision.env;
+      else
+          echo "PREVIOUS_REVISION not found!!!"
+      fi
+  script:
+    - cd .cicd/
+    - sed -i "s/__CI_PROJECT_PATH_SLUG__/${CI_PROJECT_PATH_SLUG}/" deployment.yml service.yml autoscale.yml
+    # Map variables to deployment.yml
+    - sed -i "s/__VERSION__/${IMAGE_TAG}/" deployment.yml
+    - sed -i "s/__CI_ENVIRONMENT_SLUG__/${CI_ENVIRONMENT_SLUG}/" deployment.yml
+    - sed -i "s/__REPLICA__/${REPLICA}/" deployment.yml
+    - sed -i "s/__CPU_REQUEST__/${CPU_REQUEST}/" deployment.yml
+    - sed -i "s/__MEMORY_REQUEST__/${MEMORY_REQUEST}/" deployment.yml
+    - sed -i "s/__MEMORY_LIMIT__/${MEMORY_LIMIT}/" deployment.yml
+    - sed -i "s/__CPU_LIMIT__/${CPU_LIMIT}/" deployment.yml
+    - sed -i "s~__CI_REGISTRY_IMAGE__~${GCP_HOST_DOCKER}~" deployment.yml
+    # Map variables to service.yml
+    - sed -i "s/__CDN_API_DOMAIN__/${CDN_API_DOMAIN}/" service.yml
+    - sed -i "s/__CDN_API_INGRESS_CLASS__/${INGRESS_CLASS}/" service.yml
+    # Map variables to autoscale.yml
+    - sed -i "s/__MIN_REPLICAS__/${MIN_REPLICAS}/" autoscale.yml
+    - sed -i "s/__MAX_REPLICAS__/${MAX_REPLICAS}/" autoscale.yml
+    - sed -i "s/__CPU_TARGET__/${CPU_TARGET}/" autoscale.yml
+    - sed -i "s/__MEMORY_TARGET__/${MEMORY_TARGET}/" autoscale.yml
+    # Deploy k8s
+    - cat deployment.yml
+    - kubectl apply -f deployment.yml -n $APP_NAMESPACE
+    - cat service.yml
+    - kubectl apply -f service.yml -n $APP_NAMESPACE
+    - cat autoscale.yml
+    - kubectl apply -f autoscale.yml -n $APP_NAMESPACE
+    - kubectl rollout status deployments/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE
+    - kubectl annotate deployment/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE kubernetes.io/change-cause="$CHANGE_CAUSE"
+    - kubectl get deployments/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE -o yaml
+
+.job:rollback:
+  tags:
+    - k8s
+  image:
+    name: bitnami/kubectl
+    entrypoint: [""]
+  rules:
+    - !reference [.rules:deploy, rules]
+    - when: never
+  before_script:
+    - kubectl config get-contexts
+    - kubectl config use-context $KUBE_CONTEXT
+    - |
+      # directly access the custom.env file created in another job
+      ls -l $CI_PROJECT_DIR
+      [ -f revision.env ] && source revision.env
+  script:
+    - echo "deployment/$CI_PROJECT_PATH_SLUG"
+    - echo "(read from custom.env) PREVIOUS_REVISION = $PREVIOUS_REVISION"
+    - echo "Rollback to revision $PREVIOUS_REVISION "
+    - |
+      if [ $PREVIOUS_REVISION ]; then
+          kubectl rollout undo deployments/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE --to-revision=$PREVIOUS_REVISION
+          kubectl rollout status deployments/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE
+          kubectl get deployments/$CI_PROJECT_PATH_SLUG -n $APP_NAMESPACE -o yaml
+      else
+          echo "PREVIOUS_REVISION not found!!!"
+      fi
+
+# install dependencies
+install:dependencies:
+  tags:
+    - prepare
+  cache:
+    - <<: *cache-node_modules
+      policy: pull-push
+  stage: prepare
+  artifacts:
+    when: on_success
+    expire_in: 2 weeks
+    paths:
+      - node_modules
+      - package.json
+      - yarn.lock
+  rules:
+    - !reference [.rules:test, rules]
+    - when: never
+  script:
+    - apk add git
+    - yarn global add @nestjs/cli node-gyp
+    - yarn
+
+# eslint test
+lint:check:
+  tags:
+    - compile
+  stage: compile
+  needs:
+    - job: install:dependencies
+      artifacts: true
+  rules:
+    - !reference [.rules:test, rules]
+    - when: never
+  script:
+    - yarn lint:check
+
+compile:
+  tags:
+    - compile
+  needs:
+    - job: install:dependencies
+      artifacts: true
+  stage: compile
+  artifacts:
+    when: on_success
+    expire_in: 2 weeks
+    paths:
+      - dist
+      - pm2.json
+      - Dockerfile
+  rules:
+    - !reference [.rules:test, rules]
+    - when: never
+  script:
+    - ls -a
+    - yarn build
+
+# unit test
+test:coverage:
+  tags:
+    - test
+  stage: test
+  needs:
+    - job: install:dependencies
+      artifacts: true
+    - job: lint:check
+      artifacts: false
+    - job: compile
+      artifacts: false
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - junit.xml
+  rules:
+    - !reference [.rules:test, rules]
+    - when: never
+  script:
+    - echo "BYPASS_TEST - $BYPASS_TEST"
+    - |
+      if [ $BYPASS_TEST == "true" ]; then
+          echo "Test bypassed"
+      else
+          echo "Test executing..."
+          yarn test:report
+      fi
+
+build:image:
+  image: google/cloud-sdk:alpine
+  tags:
+    - build
+  extends: .build_docker_template
+  stage: build
+  needs:
+    - job: install:dependencies
+      artifacts: true
+    - job: test:coverage
+      artifacts: false
+    - job: compile
+      artifacts: true
+  rules:
+    - !reference [.rules:build, rules]
+    - when: never
+  services:
+    - name: "docker:20.10.6-dind"
+      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
+  variables:
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - echo $CI_JOB_TOKEN | docker login -u gitlab-ci-token registry.gitlab.com --password-stdin
+    - cat $GCP_CICD_CDN_V2|base64 -d > ${HOME}/gcloud-service-key.json
+    - gcloud auth login --cred-file=${HOME}/gcloud-service-key.json
+    - gcloud config set project $GCP_PROJECT_ID
+    - gcloud auth configure-docker --quiet
+  script:
+    - ls -a
+    - docker build -t $GCP_HOST_DOCKER:latest .
+    - |
+      echo "Version $GCP_HOST_DOCKER:$IMAGE_TAG"
+      docker tag $GCP_HOST_DOCKER:latest $GCP_HOST_DOCKER:$IMAGE_TAG
+      docker push $GCP_HOST_DOCKER --all-tags
+
+# DEVELOP
+# deploy dev env
+1-deploy:develop:
+  extends: .job:deploy
+  variables:
+    INGRESS_CLASS: nginx
+  stage: develop
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ "/^develop$/" && $CI_PIPELINE_SOURCE == "push"'
+      when: on_success
+    - !reference [.rules:deploy, rules]
+    - when: never
+  environment:
+    name: staging
+    url: $CDN_API_DOMAIN
+    kubernetes:
+      namespace: $APP_NAMESPACE
+
+# rollback
+2-rollback:develop:
+  extends: .job:rollback
+  stage: develop
+  needs:
+    - job: 1-deploy:develop
+      artifacts: true
+  environment:
+    name: staging
+    url: $CDN_API_DOMAIN
+    kubernetes:
+      namespace: $APP_NAMESPACE
+
+# BETA
+# deploy beta env
+# 1-deploy:beta:
+#   extends: .job:deploy
+#   variables:
+#     INGRESS_CLASS: nginx
+#   stage: beta
+#   rules:
+#     - if: '$CI_COMMIT_BRANCH =~ "/^release\-\S{1,}$/" && $CI_PIPELINE_SOURCE == "push"'
+#       when: on_success
+#     - !reference [.rules:deploy, rules]
+#     - when: never
+#   environment:
+#     name: beta
+#     url: $CDN_API_DOMAIN
+#     kubernetes:
+#       namespace: $APP_NAMESPACE
+
+# # rollback
+# 2-rollback:beta:
+#   extends: .job:rollback
+#   stage: beta
+#   needs:
+#     - job: 1-deploy:beta
+#       artifacts: true
+#   environment:
+#     name: beta
+#     url: $CDN_API_DOMAIN
+#     kubernetes:
+#       namespace: $APP_NAMESPACE
+
+# PRODUCTION
+# deploy production env
+1-go-live:
+  extends: .job:deploy
+  variables:
+    INGRESS_CLASS: haproxy
+  stage: production
+  rules:
+    - !reference [.rules:deploy-prod, rules]
+    - when: never
+  environment:
+    name: production
+    url: $CDN_API_DOMAIN
+    kubernetes:
+      namespace: $APP_NAMESPACE
+
+# rollback
+2-rollback:production:
+  extends: .job:rollback
+  stage: production
+  rules:
+    - !reference [.rules:deploy-prod, rules]
+    - when: never
+  needs:
+    - job: 1-go-live
+      artifacts: true
+  environment:
+    name: production
+    url: $CDN_API_DOMAIN
+    kubernetes:
+      namespace: $APP_NAMESPACE
